@@ -156,3 +156,5 @@ psychedelic_env/
 .amltmp/
 *.amltmp
 .amlignore
+perturbative_llm_cognition.egg-info
+notebooks/.ipynb_aml_checkpoints/
