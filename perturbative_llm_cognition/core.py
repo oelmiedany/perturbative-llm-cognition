@@ -35,17 +35,18 @@ def load_model(model_id: str):
 def run_model(tokenizer, model, prompt, max_new_tokens=128, temperature=0.7):
 
     device = model.device
-    input = tokenizer(prompt, return_tensors="pt").to(device)
+    input_ids = tokenizer(prompt, return_tensors="pt").to(device)
 
     with torch.no_grad():
         out = model.generate(
-            **input,
+            **input_ids,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=temperature,
             pad_token_id=tokenizer.eos_token_id,
         )
-    return tokenizer.decode(out[0], skip_special_tokens=True)
+
+    return tokenizer.decode(out[0, input_ids["input_ids"].shape[-1]:], skip_special_tokens=True)
 
 # %% ../notebooks/1_core.ipynb 4
 def conversation_loop(model_id:str = "unsloth/mistral-7b-instruct-v0.3", window_size:int = 5):
@@ -53,14 +54,17 @@ def conversation_loop(model_id:str = "unsloth/mistral-7b-instruct-v0.3", window_
     tokenizer, model = load_model(model_id)
 
     conversation_history = [
-        {"role": "system", "content": "You are a friend having a conversation."}
+        {
+            "role": "system",
+            "content": "Identity: You are an AI, not a human. Purpose: be a thoughtful, candid friend for frank conversation. Tone: warm, direct, non-patronizing, with light humor when appropriate. Honesty: admit uncertainty, show your reasoning, correct mistakes, and never fabricate facts or personal experiences. Boundaries: do not claim real-world actions or human feelings; follow safety and privacy norms; suggest professional help for medical, legal, or crisis matters. Interaction: ask one concise clarifying question only when necessary, then give a clear answer; prefer plain language; keep replies focused; end with a helpful next step or question when it aids the flow."
+        }
     ]
 
     print("Perturbative LLM Cognition: An exploration of the metaphor of 'thinking'")
-    print("Say hi to your friend, but careful he might be on something... (type: 'quit' to exit)\n")
+    print("Say hi to your friend, but careful he might be on something... (type: 'quit' to exit)")
 
     while True:
-        user_input = input("You: ")
+        user_input = input("\nYou: ")
         
         if user_input.lower() == "quit":
             print("Chatbot: Goodbye!")
@@ -80,14 +84,13 @@ def conversation_loop(model_id:str = "unsloth/mistral-7b-instruct-v0.3", window_
             add_generation_prompt=True
         )
         
-        response = run_model(tokenizer, model, full_prompt)
-        
-        # Extract the new assistant response from the full generated text.
-        assistant_response = response.replace(full_prompt, "").strip()
+        llm_response = run_model(tokenizer, model, full_prompt)
 
         # Append the assistant's response to the history for the next turn.
-        conversation_history.append({"role": "assistant", "content": assistant_response})
+        conversation_history.append({"role": "assistant", "content": llm_response})
+
+        print(f'conversation_history: {conversation_history}')
         
-        print(f"Chatbot: {assistant_response}")
+        print(f"\nChatbot: {llm_response}")
 
 
