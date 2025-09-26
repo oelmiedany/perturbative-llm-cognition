@@ -158,3 +158,4 @@ psychedelic_env/
 .amlignore
 perturbative_llm_cognition.egg-info
 notebooks/.ipynb_aml_checkpoints/
+llm_modification_env/

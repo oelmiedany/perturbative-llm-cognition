@@ -76,6 +76,8 @@ def conversation_loop( tokenizer, model, window_size:int = 5, max_new_tokens:int
         if user_input.lower() == "quit":
             print("Chatbot: Goodbye!")
             break
+        elif user_input == None:
+            continue
 
         # Append the new user message
         conversation_history.append({"role": "user", "content": user_input})
