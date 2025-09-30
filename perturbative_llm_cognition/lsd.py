@@ -89,79 +89,107 @@ class LSDPerturbedLLM:
     def apply_perturbation(self):
         """Apply perturbations while preserving original functions"""
         # Always recreate the perturbation functions to get updated parameters
-        self.apply_attention_perturbation()
-
-
-    def apply_attention_perturbation(self):
-        """Apply perturbations by directly modifying attention weights"""
-        
+        #self.apply_attention_perturbation()
         for i, block in enumerate(self.model.model.layers):
-            if not self.is_target_layer(i):
-                continue
-                
-            print(f"Applying perturbation to layer {i}")
-            
-            # Store original forward
-            original_forward = block.self_attn.forward
-            
-            def create_perturbed_forward(original_forward, layer_idx, self_ref):
-                def perturbed_forward(*args, **kwargs):
-                    print(f"DEBUG: Perturbed attention called for layer {layer_idx}")
-                    
-                    # Call the original forward to get the result
-                    result = original_forward(*args, **kwargs)
-                    
-                    # If we got attention weights, modify them
-                    if isinstance(result, tuple) and len(result) >= 2:
-                        
-                        if len(result) == 2:
-                            attn_output, attn_weights = result
-                            past_key_value = None
-                        else:
-                            attn_output, attn_weights, past_key_value = result
+            if self.is_target_layer(i):
+                original_forward = block.self_attn.forward
+                num_heads = self.model.config.num_attention_heads
+                head_dim = self.model.config.hidden_size // num_heads
+                num_kv_heads = getattr(self.model.config, 'num_key_value_heads', num_heads // 4)
+                v_proj = block.self_attn.v_proj
+                o_proj = block.self_attn.o_proj
 
-                        if attn_weights is not None:
-                            print(f"Found attention weights with shape: {attn_weights.shape}")
-                            
-                            # Apply your modifications to the attention weights
-                            modified_weights = attn_weights.clone()
-                            
-                            # Temperature scaling
-                            modified_weights = modified_weights / self.attention_temperature
-                            
-                            # Diagonal penalty for decode step
-                            if modified_weights.size(-2) == 1:
-                                modified_weights[..., -1] = modified_weights[..., -1] - self.attention_diagonal_penalty
+                block.self_attn.forward = self.create_perturbed_forward(original_forward, num_heads, head_dim, num_kv_heads, v_proj, o_proj, i)
 
-                            # Apply softmax
-                            attn_weights = torch.softmax(attn_weights, dim=-1)
-                            
-                            # Apply attention to values
-                            attn_output = torch.matmul(attn_weights, value_states)
-                            
-                            # Reshape back
-                            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, num_heads * head_dim)
-                            
-                            # Apply output projection
-                            attn_output = attn_layer.o_proj(attn_output)
-                            
-                            
-                            print(f"Applied modifications: tau={self.attention_temperature}, diag={self_ref.attention_diagonal_penalty}")
-                            
-                            # Return modified result
-                            if past_key_value is not None:
-                                return attn_output, modified_weights, past_key_value
-                            else:
-                                return attn_output, modified_weights
-                    
-                    return result
-                        
-                return perturbed_forward
+
+    def create_perturbed_forward(self, original_forward, num_heads, head_dim, num_kv_heads, v_proj, o_proj, layer_idx):
+        
+        def perturbed_forward(*args, **kwargs):
+            print(f"DEBUG: Perturbed attention called for layer {layer_idx}")
             
-            block.self_attn.forward = create_perturbed_forward(original_forward, i, self)
+            # Extract hidden_states from kwargs
+            hidden_states = kwargs.get('hidden_states', args[0] if len(args) > 0 else None)
+            
+            if hidden_states is None:
+                print("WARNING: Could not find hidden_states")
+                return original_forward(*args, **kwargs)
+            
+            # Get dimensions
+            batch_size, seq_len, hidden_size = hidden_states.shape
+            
+            # Get KV heads and repeat groups from config
+            groups = num_heads // num_kv_heads
+            
+            # Project to get value states (this gives us 1024 = num_kv_heads * head_dim)
+            value_states = v_proj(hidden_states)  # [B, T, 1024]
+            
+            # Reshape value states for multi-head attention (KV heads)
+            value_states = value_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)  # [B, num_kv_heads, T, head_dim]
+            
+            # Handle past key values if they exist
+            past_key_value = kwargs.get('past_key_value', None)
+            if past_key_value is not None:
+                past_key, past_value = past_key_value
+                # Concatenate past values with current values
+                value_states = torch.cat([past_value, value_states], dim=2)
+            
+            # Repeat KV to match Q heads (this is the key part!)
+            if groups > 1:
+                value_states = value_states.unsqueeze(2).expand(batch_size, num_kv_heads, groups, value_states.size(2), head_dim)
+                value_states = value_states.reshape(batch_size, num_heads, value_states.size(3), head_dim)
+            
+            # Call original forward to get attention weights
+            result = original_forward(*args, **kwargs)
+            
+            # Extract attention weights
+            if isinstance(result, tuple) and len(result) >= 2:
+                if len(result) == 2:
+                    attn_output, attn_weights = result
+                else:
+                    attn_output, attn_weights, past_key_value = result
+
+                if attn_weights is not None:
+                    print(f"Found attention weights with shape: {attn_weights.shape}")
+                    
+                    # Apply your modifications to the attention weights
+                    modified_weights = attn_weights.clone()
+                    
+                    # Temperature scaling
+                    modified_weights = modified_weights / self.attention_temperature
+                    
+                    # Diagonal penalty for decode step
+                    if modified_weights.size(-2) == 1:
+                        modified_weights[..., -1] = modified_weights[..., -1] - self.attention_diagonal_penalty
+
+                    # Apply softmax to get attention probabilities
+                    modified_weights = torch.softmax(modified_weights, dim=-1)
+                    
+                    # Apply modified attention weights to values
+                    print(f"Modified weights shape: {modified_weights.shape}")
+                    print(f"Value states shape: {value_states.shape}")
+                    print(f"Expected matmul: {modified_weights.shape} @ {value_states.shape}")
+                    attn_output = torch.matmul(modified_weights, value_states)
+                    
+                    # Reshape back to original format
+                    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+                    
+                    # Apply output projection
+                    attn_output = o_proj(attn_output)
+                    
+                    print(f"Applied modifications: tau={self.attention_temperature}, diag={self.attention_diagonal_penalty}")
+                    
+                    # Return modified result
+                    if past_key_value is not None:
+                        return attn_output, modified_weights, past_key_value
+                    else:
+                        return attn_output, modified_weights
+            
+            return result
+            
+        return perturbed_forward
 
     @staticmethod
-    def js_divergence(p, q, eps=1e-8):
+    def js_divergence(p, q, eps=1e-4):
         # Add small epsilon to avoid log(0) issues
         p = p + eps
         q = q + eps
@@ -180,6 +208,9 @@ class LSDPerturbedLLM:
         are_identical = torch.allclose(pert_logits, base_logits, atol=1e-6)
         if are_identical:
             print("WARNING: Perturbed and base logits are identical!")
+
+        print(pert_logits)
+        print(base_logits)
         
         # Distributions
         p_base = torch.softmax(base_logits, dim=-1)
