@@ -7,35 +7,37 @@ __all__ = ['LSDPerturbedLLM']
 from . import core
 
 import torch
+import numpy as np
+
 from torch import nn
 
 # %% ../notebooks/2_lsd.ipynb 1
+from hmac import new
+
+
 class LSDPerturbedLLM:
 
     def __init__(
         self, 
         layer_start: int = 21,                              # Start layer to perturb    
         layer_end: int = 30,                                # Final layer to perturb
-        attention_temperature_target: float = 1.20,         # Temperature > 1 flattens attention (scores /= temperature)
-        attention_diagonal_penalty_target: float = 0.40,    # Subtract at most-recent key at decode (q_len==1)
-        swiglu_skew_target: float = 0.15,                   # Magnitude skew exponent
-        swiglu_noise_target: float = 0.12,                  # Structured noise scale (zero-mean) <- better name required
+        attention_temperature_initial: float = 1.20,         # Temperature > 1 flattens attention (scores /= temperature)
+        attention_diagonal_penalty_initial: float = 0.40,    # Subtract at most-recent key at decode (q_len==1)
+        swiglu_skew_initial: float = 0.15,                   # Magnitude skew exponent
+        swiglu_noise_initial: float = 0.12,                  # Structured noise scale (zero-mean) <- better name required
         js_tolerance: float = 0.12,                         # Tolerated JS divergence before clamping gets strong
-        js_softness: float = 0.02,                          # Sigmoid softness around the tolerance <- better name required
-        divergence_smoothing: float = 0.8,                              # EMA smoothing for JS
-        teacher_blend_min: float = 0.05,                    # Min teacher blend weight
-        teacher_blend_max: float = 0.60,                    # Max teacher blend weight when drift is high
+        #js_softness: float = 0.1,                          # Sigmoid softness around the tolerance <- better name required
+        divergence_smoothing_factor: float = 0.8,                              # EMA smoothing for JS
+        teacher_blend_min: float = 0.10,                    # Min teacher blend weight
+        teacher_blend_max: float = 0.60,  
+        debug: bool = False                  # Max teacher blend weight when drift is high
         ):
 
         self.layer_start = max(layer_start, 0)
         self.layer_end = max(layer_end, 31)
-        self.attention_temperature_target = max(1.0, attention_temperature_target)
-        self.attention_diagonal_penalty_target = max(0.0, attention_diagonal_penalty_target)
-        self.swiglu_skew_target = max(0.0, swiglu_skew_target)
-        self.swiglu_noise_target = max(0.0, swiglu_noise_target)
         self.js_tolerance = max(0.0, js_tolerance)
-        self.js_softness = max(0.0, js_softness)
-        self.divergence_smoothing = max(0.0, divergence_smoothing)
+        #self.js_softness = max(0.0, js_softness)
+        self.divergence_smoothing_factor = max(0.0, divergence_smoothing_factor)
         self.teacher_blend_min = max(0.0, teacher_blend_min)
         self.teacher_blend_max = min(1.0, teacher_blend_max)
 
@@ -43,8 +45,8 @@ class LSDPerturbedLLM:
             raise ValueError('Invalid teacher parameters')
 
         self.set_perturbation_parameters(
-            attention_temperature=attention_temperature_target,
-            attention_diagonal_penalty=attention_diagonal_penalty_target,
+            attention_temperature=attention_temperature_initial,
+            attention_diagonal_penalty=attention_diagonal_penalty_initial,
             teacher_blend=teacher_blend_min,
             #swiglu_skew_target=swiglu_skew_target,
             #swiglu_noise_target=swiglu_noise_target,
@@ -57,6 +59,8 @@ class LSDPerturbedLLM:
 
         self._store_original_attention_functions()
 
+        self.debug = debug
+
     def set_perturbation_parameters(self, **kwargs):
         """
         Clamps all perturbation parameters to valid ranges.
@@ -64,9 +68,13 @@ class LSDPerturbedLLM:
 
         for parameter, value in kwargs.items():
             if parameter in ['attention_temperature']:
-                setattr(self, parameter, max(1.0, value))
+                setattr(self, parameter, min(max(1.0, value), 2.0))
+            
+            elif parameter in ['attention_diagonal_penalty']:
+                setattr(self, parameter, min(max(0.0, value), 1.0))
+            
             elif parameter in ['teacher_blend']:
-                setattr(self, parameter, max(0.0, min(1.0, value)))
+                setattr(self, parameter, max(self.teacher_blend_min, min(self.teacher_blend_max, value)))
             else:
                 setattr(self, parameter, max(0.0, value))
 
@@ -101,11 +109,11 @@ class LSDPerturbedLLM:
 
                 block.self_attn.forward = self.create_perturbed_forward(original_forward, num_heads, head_dim, num_kv_heads, v_proj, o_proj, i)
 
-
     def create_perturbed_forward(self, original_forward, num_heads, head_dim, num_kv_heads, v_proj, o_proj, layer_idx):
         
         def perturbed_forward(*args, **kwargs):
-            print(f"DEBUG: Perturbed attention called for layer {layer_idx}")
+            if self.debug:
+                print(f"DEBUG: Perturbed attention called for layer {layer_idx}")
             
             # Extract hidden_states from kwargs
             hidden_states = kwargs.get('hidden_states', args[0] if len(args) > 0 else None)
@@ -127,11 +135,13 @@ class LSDPerturbedLLM:
             value_states = value_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)  # [B, num_kv_heads, T, head_dim]
             
             # Handle past key values if they exist
-            past_key_value = kwargs.get('past_key_value', None)
-            if past_key_value is not None:
-                past_key, past_value = past_key_value
+            past_key_values = kwargs.get('past_key_values', None)
+            layer_cache = past_key_values.layers[layer_idx]
+            past_values = layer_cache.values
+            
+            if past_values is not None:
                 # Concatenate past values with current values
-                value_states = torch.cat([past_value, value_states], dim=2)
+                value_states = torch.cat([past_values, value_states], dim=2)
             
             # Repeat KV to match Q heads (this is the key part!)
             if groups > 1:
@@ -146,11 +156,9 @@ class LSDPerturbedLLM:
                 if len(result) == 2:
                     attn_output, attn_weights = result
                 else:
-                    attn_output, attn_weights, past_key_value = result
+                    attn_output, attn_weights, past_values = result
 
-                if attn_weights is not None:
-                    print(f"Found attention weights with shape: {attn_weights.shape}")
-                    
+                if attn_weights is not None:                    
                     # Apply your modifications to the attention weights
                     modified_weights = attn_weights.clone()
                     
@@ -165,9 +173,9 @@ class LSDPerturbedLLM:
                     modified_weights = torch.softmax(modified_weights, dim=-1)
                     
                     # Apply modified attention weights to values
-                    print(f"Modified weights shape: {modified_weights.shape}")
-                    print(f"Value states shape: {value_states.shape}")
-                    print(f"Expected matmul: {modified_weights.shape} @ {value_states.shape}")
+                    #print(f"Modified weights shape: {modified_weights.shape}")
+                    #print(f"Value states shape: {value_states.shape}")
+                    #print(f"Expected matmul: {modified_weights.shape} @ {value_states.shape}")
                     attn_output = torch.matmul(modified_weights, value_states)
                     
                     # Reshape back to original format
@@ -176,31 +184,42 @@ class LSDPerturbedLLM:
                     # Apply output projection
                     attn_output = o_proj(attn_output)
                     
-                    print(f"Applied modifications: tau={self.attention_temperature}, diag={self.attention_diagonal_penalty}")
+                    if self.debug:
+                        print(f"Applied modifications: tau={self.attention_temperature}, diag={self.attention_diagonal_penalty}")
                     
-                    # Return modified result
-                    if past_key_value is not None:
-                        return attn_output, modified_weights, past_key_value
-                    else:
-                        return attn_output, modified_weights
+                    return attn_output, modified_weights
+                    if past_values is not None:
+                        return attn_output, modified_weights, past_values
+                    
             
             return result
             
         return perturbed_forward
 
     @staticmethod
-    def js_divergence(p, q, eps=1e-4):
-        # Add small epsilon to avoid log(0) issues
-        p = p + eps
-        q = q + eps
+    def js_divergence(p, q, epsilon=1e-8, threshold=1e-4):
         
+
+        mask = (p > threshold) | (q > threshold)
+    
+        if mask.sum() == 0:
+            raise ValueError('No valid probabilities found in input distributions')
+        
+        p = p[mask]
+        q = q[mask]
+
+        # Add small epsilon to avoid log(0) issues
+        p = p + epsilon
+        q = q + epsilon
         # Renormalise
         p = p / p.sum(-1, keepdim=True)
         q = q / q.sum(-1, keepdim=True)
         
         m = 0.5 * (p + q)
+
         def kl(a, b):
             return (a * (torch.log(a) - torch.log(b))).sum(-1)
+
         return 0.5 * kl(p, m) + 0.5 * kl(q, m)
 
     def step(self, pert_logits, base_logits):
@@ -209,29 +228,29 @@ class LSDPerturbedLLM:
         if are_identical:
             print("WARNING: Perturbed and base logits are identical!")
 
-        print(pert_logits)
-        print(base_logits)
-        
         # Distributions
         p_base = torch.softmax(base_logits, dim=-1)
         p_pert = torch.softmax(pert_logits, dim=-1)
+        
         # JS divergence (batch-mean scalar)
-        d = self.js_divergence(p_pert, p_base).mean().item()
-        print(f"JS divergence: {d}")
+        divergence = self.js_divergence(p_pert, p_base).mean().item()
+        if divergence == np.nan:
+            print(f'nan divergence: {divergence}')
+            divergence = 0.0
+            
         # EMA
-        beta = self.divergence_smoothing
-        self.running_divergence = beta * self.running_divergence + (1 - beta) * d
-        # Gain (higher drift → smaller g)
-        gain = torch.sigmoid(torch.tensor((self.js_tolerance - self.running_divergence) / self.js_softness)).item()
+        self.running_divergence = self.divergence_smoothing_factor * self.running_divergence + (1 - self.divergence_smoothing_factor) * divergence
+        # Gain (high drift → backwards step, low drift → forwards step)
+        step_size = 1 + (self.js_tolerance - self.running_divergence)
 
         # Effective strengths
-        attention_temperature  = 1.0 + (self.attention_temperature_target - 1.0) * gain
-        attention_diagonal_penalty = self.attention_diagonal_penalty_target * gain
+        attention_temperature  = 1.0 + (self.attention_temperature - 1.0) * step_size
+        attention_diagonal_penalty = self.attention_diagonal_penalty * step_size
         #skew_eff = self.cfg.swiglu_skew_target * g
         #noise_eff= self.cfg.swiglu_noise_target * g
 
         # Teacher blend increases as drift grows (g small)
-        teacher_blend = self.teacher_blend_min + (1 - gain) * (self.teacher_blend_max - self.teacher_blend_min)
+        teacher_blend = self.teacher_blend_min + min(0,(1 - step_size)) * (self.teacher_blend_max - self.teacher_blend_min)
         return {
             "attention_temperature": float(attention_temperature),
             "attention_diagonal_penalty": float(attention_diagonal_penalty),
@@ -242,14 +261,14 @@ class LSDPerturbedLLM:
             #"gain": float(gain),
         }
 
-
     @torch.no_grad()
     def generate_with_leash(self,
                             prompt: str,
                             max_new_tokens: int = 128,
                             temperature: float = 0.7,
                             top_p: float = 0.95,
-                            repetition_penalty: float = 1.15):
+                            repetition_penalty: float = 1.15,
+                            only_new_tokens: bool = False):
 
 
         input_ids = self.tokenizer(prompt, return_tensors="pt").to(self.device)['input_ids']
@@ -261,7 +280,7 @@ class LSDPerturbedLLM:
         # We run two forwards per step: base (no perturb), then perturbed (with current state)
         for step in range(max_new_tokens):
             # ---- BASE pass (perturbation off)
-            print(f'base temperature: {self.attention_temperature}')
+            #print(f'base temperature: {self.attention_temperature}')
             self.reset_to_base_model()
             base_output = self.model(
                 input_ids=generated, 
@@ -272,7 +291,7 @@ class LSDPerturbedLLM:
             base_logits = base_output.logits[:, -1, :]
 
             self.apply_perturbation()
-            print(f'perturbed temperature: {self.attention_temperature}')
+            #print(f'perturbed temperature: {self.attention_temperature}')
             perturbed_output = self.model(
                 input_ids=generated, 
                 use_cache=True, 
@@ -283,23 +302,26 @@ class LSDPerturbedLLM:
 
             next_step = self.step(perturbed_logits, base_logits)
             self.set_perturbation_parameters(**next_step)
-            print(self.attention_temperature, self.attention_diagonal_penalty, self.teacher_blend)
             past_key_values = base_output.past_key_values
 
             # ---- Final logits for sampling: teacher blend
+            print(f'teacher blend: {self.teacher_blend}')
             final_logits = (1 - self.teacher_blend) * perturbed_logits + self.teacher_blend * base_logits
 
             # ---- Sample
             final_logits = final_logits / max(1e-5, temperature)
 
             if repetition_penalty != 1.0:
-                # Get recent tokens (last 50 tokens)
-                recent_tokens = generated[0, -50:] if generated.shape[1] > 50 else generated[0]
-                for token_id in recent_tokens:
+                recent_tokens = generated[0, -50:] if generated.shape[1] > 50 else generated[0]# Get recent tokens (last 50 tokens)
+
+                unique_recent_tokens = set(recent_tokens.tolist())# A set of unique recent tokens for efficient lookup
+                
+                for token_id in unique_recent_tokens:
+                    # Apply the repetition penalty to only the tokens that have appeared recently
                     if final_logits[0, token_id] < 0:
-                        final_logits[0, token_id] *= repetition_penalty
+                        final_logits[0, token_id] = final_logits[0, token_id] * repetition_penalty
                     else:
-                        final_logits[0, token_id] /= repetition_penalty
+                        final_logits[0, token_id] = final_logits[0, token_id] / repetition_penalty
 
             
             probs = torch.softmax(final_logits, dim=-1)
@@ -316,9 +338,20 @@ class LSDPerturbedLLM:
             else:
                 next_token = torch.multinomial(probs, num_samples=1)
 
+            print(self.tokenizer.decode(next_token[0]))
+
             generated = torch.cat([generated, next_token], dim=-1)
 
-        return self.tokenizer.decode(generated[0], skip_special_tokens=True)
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
+
+        if only_new_tokens:
+            new_tokens = generated[:, input_ids.shape[-1]:]
+            llm_response = self.tokenizer.decode(new_tokens[0], skip_special_tokens=True)
+        else:
+            llm_response = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+
+        return llm_response
 
     #dtype = torch.bfloat16
     #force_eager_attention: bool = True force either way

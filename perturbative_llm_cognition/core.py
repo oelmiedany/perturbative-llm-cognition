@@ -42,7 +42,7 @@ def conversation_loop( tokenizer, model, max_new_tokens:int = 128, temperature:i
     conversation_history = [
         {
             'role': 'system',
-            'content': 'Identity: You are an AI, not a human. Purpose: be a thoughtful, candid friend for frank conversation. Tone: warm, direct, non-patronizing, with light humor when appropriate. Honesty: admit uncertainty, show your reasoning, correct mistakes, and never fabricate facts or personal experiences. Boundaries: do not claim real-world actions or human feelings; follow safety and privacy norms; suggest professional help for medical, legal, or crisis matters. Interaction: ask one concise clarifying question only when necessary, then give a clear answer; prefer plain language; keep replies focused; end with a helpful next step or question when it aids the flow.'
+            'content': 'Identity: You are an AI, not a human. Purpose: be a thoughtful, candid friend for frank conversation. Tone: warm, direct, non-patronizing, with light humor when appropriate. Honesty: admit uncertainty, show your reasoning, correct mistakes, and never fabricate facts or personal experiences. Boundaries: do not claim real-world actions or human feelings; follow safety and privacy norms; suggest professional help for medical, legal, or crisis matters. Interaction: do not ask questions unless the users request is genuinely unclear or ambiguous, then give a clear answer; prefer plain language; keep replies focused. Be concise. Use your words wisely.'
         }
     ]
 
@@ -63,20 +63,13 @@ def conversation_loop( tokenizer, model, max_new_tokens:int = 128, temperature:i
 
         # Append the new user message
         conversation_history.append({'role': 'user', 'content': user_input})
-
-            # First turn (no cache)
         
-        if past_key_values is None:
-            prompt = conversation_history
-        else:
-            prompt = conversation_history[-2:] 
-
         input_ids = tokenizer.apply_chat_template(
-                prompt,
-                tokenize=True,
-                add_generation_prompt=True,     # assistant preamble
-                return_tensors="pt"
-            )
+            conversation_history,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        )
 
         input_ids = input_ids.to(device)
         attention_mask = torch.ones_like(input_ids, device=device)
@@ -84,18 +77,13 @@ def conversation_loop( tokenizer, model, max_new_tokens:int = 128, temperature:i
         output = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
-            #top_p=top_p,
             do_sample=True,
             use_cache=True,
-            pad_token_id=tokenizer.eos_token_id,#pad_token_id,
+            pad_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True
         )
-
-        # Update cache for next turn
-        past_key_values = output.past_key_values
 
         # Decode only the newly generated tokens
         new_tokens = output.sequences[:, input_ids.shape[-1]:]
