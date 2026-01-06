@@ -1,3 +1,6 @@
-This project stress-tests the idea that large language models 'think' by intentionally breaking the mechanisms that make them appear to do so. By perturbing attention layers in a trained transformer model, inspired by how psychedelics disrupt human cognition, the system’s dominant associations are flattened and destabilised. The resulting text remains fluent but loses coherent intent, revealing language generation as a process-bound phenomenom rather than an expression of understanding. This work uses architectural intervention to expose the gap between linguistic competence and cognition, treating LLMs as tools for critique and creative distortion rather than as artificial minds.
+#Perturbative LLM Cognition 
+
+This repository accompanies an article that examines the often-implied relationship between large language models and human thought by deliberately pushing that assumption to failure. Inspired by how psychedelics alter cognitive processing in the brain, the project asks what kinds of internal modifications would be required to provoke comparable shifts in a transformer model’s behaviour, and what those shifts reveal about the nature of language generation when the model’s trained assumptions are suspended.
+
 
 Read the full article [here](https://medium.com/@omarelmiedany/language-without-an-end-psychedelic-perturbations-in-large-language-models-b4d30380e69d)
