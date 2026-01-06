@@ -4,3 +4,11 @@ This repository accompanies an article that examines the often-implied relations
 
 
 Read the full article [here](https://medium.com/@omarelmiedany/language-without-an-end-psychedelic-perturbations-in-large-language-models-b4d30380e69d)
+
+## To try the modified model
+1. Clone the Repository
+2. Install dependencies
+``` sh
+$ pip install -e .
+```
+3.  CD to experiments and run [`perturbed_chat.py`](./experiments/perturbed_chat.py)
