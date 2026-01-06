@@ -8,258 +8,221 @@ from . import core
 
 import torch
 import numpy as np
+import math
+import types
 
 from torch import nn
+from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb, repeat_kv
 
 # %% ../notebooks/2_lsd.ipynb 1
-from hmac import new
-
-
 class LSDPerturbedLLM:
 
     def __init__(
         self, 
-        layer_start: int = 21,                              # Start layer to perturb    
-        layer_end: int = 30,                                # Final layer to perturb
-        attention_temperature_initial: float = 1.20,         # Temperature > 1 flattens attention (scores /= temperature)
-        attention_diagonal_penalty_initial: float = 0.40,    # Subtract at most-recent key at decode (q_len==1)
-        swiglu_skew_initial: float = 0.15,                   # Magnitude skew exponent
-        swiglu_noise_initial: float = 0.12,                  # Structured noise scale (zero-mean) <- better name required
-        js_tolerance: float = 0.12,                         # Tolerated JS divergence before clamping gets strong
-        #js_softness: float = 0.1,                          # Sigmoid softness around the tolerance <- better name required
-        divergence_smoothing_factor: float = 0.8,                              # EMA smoothing for JS
-        teacher_blend_min: float = 0.10,                    # Min teacher blend weight
-        teacher_blend_max: float = 0.60,  
-        debug: bool = False                  # Max teacher blend weight when drift is high
+        layer_start: int = 21,                                  # Start layer to perturb    
+        layer_end: int = 27,                                    # End layer to perturb
+        attention_scaling_factor: float = 1.4,                  # Scaling factor for the attention scores
+        attention_noise: float = 0.3,                           # Noise applied to the attention scores
+        attention_diagonal_penalty:float = 0.2,                 # Penalty for the diagonal attention scores
+        attention_probability_smoothing_factor: float = 0.5,    # Smoothing factor for the attention probs
+        js_tolerance: float = 0.2,                              # Tolerated JS divergence before leashing is maximised
+        perturbation_blend_min: float = 0.10,                   # Min perturbation blend 
+        perturbation_blend_max: float = 0.50,                   # Max perturbation blend 
+        debug: bool = False                                     # debug flag, when true debug information is printed
         ):
 
+        # Initialises and validates target layers
         self.layer_start = max(layer_start, 0)
         self.layer_end = max(layer_end, 31)
+
+        # Initialises and validates leash parameters
         self.js_tolerance = max(0.0, js_tolerance)
-        #self.js_softness = max(0.0, js_softness)
-        self.divergence_smoothing_factor = max(0.0, divergence_smoothing_factor)
-        self.teacher_blend_min = max(0.0, teacher_blend_min)
-        self.teacher_blend_max = min(1.0, teacher_blend_max)
+        self.perturbation_blend_min = max(0.0, perturbation_blend_min)
+        self.perturbation_blend_max = min(1.0, perturbation_blend_max)
 
-        if self.teacher_blend_min > self.teacher_blend_max:
-            raise ValueError('Invalid teacher parameters')
+        # Checks if the leash parameters are valid
+        if self.perturbation_blend_min > self.perturbation_blend_max:
+            raise ValueError('Invalid leash parameters')
 
-        self.set_perturbation_parameters(
-            attention_temperature=attention_temperature_initial,
-            attention_diagonal_penalty=attention_diagonal_penalty_initial,
-            teacher_blend=teacher_blend_min,
-            #swiglu_skew_target=swiglu_skew_target,
-            #swiglu_noise_target=swiglu_noise_target,
-        )
+        # Initialises the attention parameters
+        self.attention_scaling_factor = attention_scaling_factor
+        self.attention_noise = attention_noise
+        self.attention_diagonal_penalty = attention_diagonal_penalty
+        self.attention_probability_smoothing_factor = attention_probability_smoothing_factor
 
+        # Initialises the model
         self.tokenizer, self.model = core.load_tokenizer_and_model()
         self.model.config.attn_implementation = 'eager'
         self.model.config._attn_implementation = 'eager'  # Also try this
         self.device = self.model.device
 
+        #Stores original attention functions
         self._store_original_attention_functions()
 
+        # Debug flag
         self.debug = debug
 
-    def set_perturbation_parameters(self, **kwargs):
-        """
-        Clamps all perturbation parameters to valid ranges.
-        """
-
-        for parameter, value in kwargs.items():
-            if parameter in ['attention_temperature']:
-                setattr(self, parameter, min(max(1.0, value), 2.0))
-            
-            elif parameter in ['attention_diagonal_penalty']:
-                setattr(self, parameter, min(max(0.0, value), 1.0))
-            
-            elif parameter in ['teacher_blend']:
-                setattr(self, parameter, max(self.teacher_blend_min, min(self.teacher_blend_max, value)))
-            else:
-                setattr(self, parameter, max(0.0, value))
-
     def _store_original_attention_functions(self):
-        """Store original attention forward functions for reset capability"""
+        """Stores original attention forward functions"""
         self.original_attention_forwards = {}
         for i, block in enumerate(self.model.model.layers):
             if self.is_target_layer(i):
                 self.original_attention_forwards[i] = block.self_attn.forward
 
     def reset_to_base_model(self):
-        """Completely reset model to base state by restoring original functions"""
+        """Reapplies the stored original functions for the unperturbed execution of the model as part of the leash mechanism"""
         for i, block in enumerate(self.model.model.layers):
             if self.is_target_layer(i) and i in self.original_attention_forwards:
                 block.self_attn.forward = self.original_attention_forwards[i]
 
     def is_target_layer(self, index: int) -> bool:
+        """Returns True if the layer is a target layer"""
         return self.layer_start <= index < self.layer_end
 
     def apply_perturbation(self):
-        """Apply perturbations while preserving original functions"""
-        # Always recreate the perturbation functions to get updated parameters
-        #self.apply_attention_perturbation()
+        """Applies perturbations by replacing the attention forward function"""
         for i, block in enumerate(self.model.model.layers):
             if self.is_target_layer(i):
-                original_forward = block.self_attn.forward
-                num_heads = self.model.config.num_attention_heads
-                head_dim = self.model.config.hidden_size // num_heads
-                num_kv_heads = getattr(self.model.config, 'num_key_value_heads', num_heads // 4)
-                v_proj = block.self_attn.v_proj
-                o_proj = block.self_attn.o_proj
+                layer = block.self_attn
+                self.create_perturbed_forward(layer, i)
 
-                block.self_attn.forward = self.create_perturbed_forward(original_forward, num_heads, head_dim, num_kv_heads, v_proj, o_proj, i)
+    def create_perturbed_forward(self, layer, layer_idx):
+        """Returns pertured attention forward function"""
 
-    def create_perturbed_forward(self, original_forward, num_heads, head_dim, num_kv_heads, v_proj, o_proj, layer_idx):
+        # Retrieves the perturbation parameters
+        attention_scaling_factor = self.attention_scaling_factor
+        attention_noise = self.attention_noise
+        diag_penalty = self.attention_diagonal_penalty
+        attention_probability_smoothing_factor = self.attention_probability_smoothing_factor
+        debug = self.debug
+
+        # Creates the perturbed forward function
+        def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            cache_position=None,
+        ):
+            b, q_len, _ = hidden_states.size()
+            
+            # Query, Key, Value projections
+            q = self.q_proj(hidden_states).view(b, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.k_proj(hidden_states).view(b, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            v = self.v_proj(hidden_states).view(b, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            
+            # Applies Rotary Positional Embeddings (RoPE) to the query and key
+            seq_len = v.shape[-2]
+            cos, sin = self.rotary_emb(
+                v,
+                position_ids if position_ids is not None else torch.arange(seq_len, device=v.device).unsqueeze(0))
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids=None)
+            
+            # Cache update
+            if past_key_value is not None:
+                k, v = past_key_value.update(k, v, layer_idx, {'sin': sin, 'cos': cos, 'cache_position': cache_position})
+            
+            # Expand KV
+            k = repeat_kv(k, self.num_key_value_groups)
+            v = repeat_kv(v, self.num_key_value_groups)
+            
+            # Attention logits
+            attention_scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if attention_mask is not None:
+                attention_scores = attention_scores + attention_mask[:, :, :, : k.size(-2)]
+            
+            # Perturbation modifications 
+
+            # Scales the attention scores (modification)
+            attention_scores = attention_scores / attention_scaling_factor
+
+            # Adds Gaussian noise
+            noise = torch.randn_like(attention_scores) * attention_noise
+            attention_scores = attention_scores + noise
+
+            # Applies diagonal penalty (modification)
+            if attention_scores.shape[-2] == 1:
+                attention_scores[..., -1] = attention_scores[..., -1] - diag_penalty
+
+            # Calculates the attention probs
+            attention_probs = nn.functional.softmax(attention_scores, dim=-1).to(q.dtype)
+
+            # Flatten distributions (modification)
+            attention_probs = attention_probs ** attention_probability_smoothing_factor
+            attention_probs = attention_probs / attention_probs.sum(dim=-1, keepdim=True)
+
+            attention_probs = nn.functional.dropout(attention_probs, p=self.attention_dropout, training=self.training)#Disabled
+            
+            attention_output = torch.matmul(attention_probs, v).transpose(1, 2).contiguous().view(b, q_len, -1)
+            attention_output = self.o_proj(attention_output)
+            
+            if debug:
+                print(f'[L{layer_idx}] attention_scaling_factor={attention_scaling_factor} attention_noise={attention_noise} diag={diag_penalty}')
+            
+            return (
+                attention_output,
+                (attention_probs if output_attentions else None),
+                (past_key_value if use_cache else None),
+            )
         
-        def perturbed_forward(*args, **kwargs):
-            if self.debug:
-                print(f"DEBUG: Perturbed attention called for layer {layer_idx}")
-            
-            # Extract hidden_states from kwargs
-            hidden_states = kwargs.get('hidden_states', args[0] if len(args) > 0 else None)
-            
-            if hidden_states is None:
-                print("WARNING: Could not find hidden_states")
-                return original_forward(*args, **kwargs)
-            
-            # Get dimensions
-            batch_size, seq_len, hidden_size = hidden_states.shape
-            
-            # Get KV heads and repeat groups from config
-            groups = num_heads // num_kv_heads
-            
-            # Project to get value states (this gives us 1024 = num_kv_heads * head_dim)
-            value_states = v_proj(hidden_states)  # [B, T, 1024]
-            
-            # Reshape value states for multi-head attention (KV heads)
-            value_states = value_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)  # [B, num_kv_heads, T, head_dim]
-            
-            # Handle past key values if they exist
-            past_key_values = kwargs.get('past_key_values', None)
-            layer_cache = past_key_values.layers[layer_idx]
-            past_values = layer_cache.values
-            
-            if past_values is not None:
-                # Concatenate past values with current values
-                value_states = torch.cat([past_values, value_states], dim=2)
-            
-            # Repeat KV to match Q heads (this is the key part!)
-            if groups > 1:
-                value_states = value_states.unsqueeze(2).expand(batch_size, num_kv_heads, groups, value_states.size(2), head_dim)
-                value_states = value_states.reshape(batch_size, num_heads, value_states.size(3), head_dim)
-            
-            # Call original forward to get attention weights
-            result = original_forward(*args, **kwargs)
-            
-            # Extract attention weights
-            if isinstance(result, tuple) and len(result) >= 2:
-                if len(result) == 2:
-                    attn_output, attn_weights = result
-                else:
-                    attn_output, attn_weights, past_values = result
-
-                if attn_weights is not None:                    
-                    # Apply your modifications to the attention weights
-                    modified_weights = attn_weights.clone()
-                    
-                    # Temperature scaling
-                    modified_weights = modified_weights / self.attention_temperature
-                    
-                    # Diagonal penalty for decode step
-                    if modified_weights.size(-2) == 1:
-                        modified_weights[..., -1] = modified_weights[..., -1] - self.attention_diagonal_penalty
-
-                    # Apply softmax to get attention probabilities
-                    modified_weights = torch.softmax(modified_weights, dim=-1)
-                    
-                    # Apply modified attention weights to values
-                    #print(f"Modified weights shape: {modified_weights.shape}")
-                    #print(f"Value states shape: {value_states.shape}")
-                    #print(f"Expected matmul: {modified_weights.shape} @ {value_states.shape}")
-                    attn_output = torch.matmul(modified_weights, value_states)
-                    
-                    # Reshape back to original format
-                    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, num_heads * head_dim)
-                    
-                    # Apply output projection
-                    attn_output = o_proj(attn_output)
-                    
-                    if self.debug:
-                        print(f"Applied modifications: tau={self.attention_temperature}, diag={self.attention_diagonal_penalty}")
-                    
-                    return attn_output, modified_weights
-                    if past_values is not None:
-                        return attn_output, modified_weights, past_values
-                    
-            
-            return result
-            
-        return perturbed_forward
+        # Binds the perturbed forward function to the layer
+        layer.forward = types.MethodType(forward, layer)
+        return layer
 
     @staticmethod
-    def js_divergence(p, q, epsilon=1e-8, threshold=1e-4):
-        
-
+    def js_divergence(p, q, epsilon=1e-6, threshold=1e-6):
         mask = (p > threshold) | (q > threshold)
     
         if mask.sum() == 0:
-            raise ValueError('No valid probabilities found in input distributions')
+            raise ValueError('No valid probs found in input distributions')
         
         p = p[mask]
         q = q[mask]
 
-        # Add small epsilon to avoid log(0) issues
+        # Adds small epsilon to avoid log(0) issues
         p = p + epsilon
         q = q + epsilon
-        # Renormalise
+        # Renormalises values
         p = p / p.sum(-1, keepdim=True)
         q = q / q.sum(-1, keepdim=True)
         
         m = 0.5 * (p + q)
 
-        def kl(a, b):
+        def kl_divergence(a, b):
             return (a * (torch.log(a) - torch.log(b))).sum(-1)
 
-        return 0.5 * kl(p, m) + 0.5 * kl(q, m)
+        return 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
 
-    def step(self, pert_logits, base_logits):
-        # Debug: check if logits are identical
+    def set_perturbation_blend(self, pert_logits, base_logits):
+        # Raises an error if the perturbed and base logits are identical
         are_identical = torch.allclose(pert_logits, base_logits, atol=1e-6)
         if are_identical:
-            print("WARNING: Perturbed and base logits are identical!")
+            raise ValueError("WARNING: Perturbed and base logits are identical!")
 
-        # Distributions
+        # Probability Distributions
         p_base = torch.softmax(base_logits, dim=-1)
         p_pert = torch.softmax(pert_logits, dim=-1)
         
-        # JS divergence (batch-mean scalar)
+        # JS divergence 
         divergence = self.js_divergence(p_pert, p_base).mean().item()
-        if divergence == np.nan:
+        if np.isnan(divergence):
             print(f'nan divergence: {divergence}')
             divergence = 0.0
             
-        # EMA
-        self.running_divergence = self.divergence_smoothing_factor * self.running_divergence + (1 - self.divergence_smoothing_factor) * divergence
-        # Gain (high drift → backwards step, low drift → forwards step)
-        step_size = 1 + (self.js_tolerance - self.running_divergence)
+        # Blend ratio based on the JS divergence
+        divergence = divergence
+        js_tolerance = self.js_tolerance
 
-        # Effective strengths
-        attention_temperature  = 1.0 + (self.attention_temperature - 1.0) * step_size
-        attention_diagonal_penalty = self.attention_diagonal_penalty * step_size
-        #skew_eff = self.cfg.swiglu_skew_target * g
-        #noise_eff= self.cfg.swiglu_noise_target * g
+        perturbation_blend_percentage = ((js_tolerance - divergence) / js_tolerance)
+        perturbation_blend_percentage = min(max(0.0, perturbation_blend_percentage), 1.0)
+        self.perturbation_blend = self.perturbation_blend_max - (self.perturbation_blend_max - self.perturbation_blend_min) * perturbation_blend_percentage
 
-        # Teacher blend increases as drift grows (g small)
-        teacher_blend = self.teacher_blend_min + min(0,(1 - step_size)) * (self.teacher_blend_max - self.teacher_blend_min)
-        return {
-            "attention_temperature": float(attention_temperature),
-            "attention_diagonal_penalty": float(attention_diagonal_penalty),
-            #"skew_eff": float(skew_eff),
-            #"noise_eff": float(noise_eff),
-            "teacher_blend": float(teacher_blend),  # Fixed parameter name
-            #"ema_js": float(self.running_divergence),
-            #"gain": float(gain),
-        }
+        if self.debug:
+            print(f'Divergence: {divergence}, Perturbation blend percentage: {perturbation_blend_percentage}')
+
 
     @torch.no_grad()
     def generate_with_leash(self,
@@ -270,61 +233,71 @@ class LSDPerturbedLLM:
                             repetition_penalty: float = 1.15,
                             only_new_tokens: bool = False):
 
-
-        input_ids = self.tokenizer(prompt, return_tensors="pt").to(self.device)['input_ids']
-        generated = input_ids
-        past_key_values = None
+        input_ids = self.tokenizer(prompt, return_tensors='pt').to(self.device)['input_ids']
+        generated = input_ids.clone()
+        
+        base_past_key_values = None
+        perturbed_past_key_values = None
 
         self.running_divergence = 0.0
 
-        # We run two forwards per step: base (no perturb), then perturbed (with current state)
+        # Runs the model for the maximum number of new tokens
         for step in range(max_new_tokens):
-            # ---- BASE pass (perturbation off)
-            #print(f'base temperature: {self.attention_temperature}')
+            # Determines input_ids for this step
+            if base_past_key_values is None:
+                current_input_ids = input_ids# Full prompt is used for the first step
+            else:
+                current_input_ids = generated[:, -1:]# Only the last generated token is used for subsequent steps
+
+            # The model is executed twice as part of the leash mechanism
+            # Unperturbed execution
             self.reset_to_base_model()
             base_output = self.model(
-                input_ids=generated, 
+                input_ids=current_input_ids, 
                 use_cache=True, 
-                past_key_values=past_key_values, 
+                past_key_values=base_past_key_values, 
                 output_hidden_states=True)
             
             base_logits = base_output.logits[:, -1, :]
 
+            # Perturbed execution
             self.apply_perturbation()
-            #print(f'perturbed temperature: {self.attention_temperature}')
             perturbed_output = self.model(
-                input_ids=generated, 
+                input_ids=current_input_ids, 
                 use_cache=True, 
-                past_key_values=past_key_values, 
+                past_key_values=perturbed_past_key_values,
                 output_hidden_states=True)
 
             perturbed_logits = perturbed_output.logits[:, -1, :]
 
-            next_step = self.step(perturbed_logits, base_logits)
-            self.set_perturbation_parameters(**next_step)
-            past_key_values = base_output.past_key_values
+            # Updates the past key values
+            base_past_key_values = base_output.past_key_values
+            perturbed_past_key_values = perturbed_output.past_key_values            
+            
+            # Perturbation blend calculated and applied to create final logits
+            self.set_perturbation_blend(perturbed_logits, base_logits)
+            final_logits = (1 - self.perturbation_blend) * perturbed_logits + self.perturbation_blend * base_logits
 
-            # ---- Final logits for sampling: teacher blend
-            print(f'teacher blend: {self.teacher_blend}')
-            final_logits = (1 - self.teacher_blend) * perturbed_logits + self.teacher_blend * base_logits
+            if self.debug:
+                print(f'Perturbation blend: {self.perturbation_blend}')
 
-            # ---- Sample
-            final_logits = final_logits / max(1e-5, temperature)
+            # Applies temperature to the final logits
+            final_logits = final_logits / temperature
 
-            if repetition_penalty != 1.0:
-                recent_tokens = generated[0, -50:] if generated.shape[1] > 50 else generated[0]# Get recent tokens (last 50 tokens)
-
-                unique_recent_tokens = set(recent_tokens.tolist())# A set of unique recent tokens for efficient lookup
+            # Applies repetition penalty to the final logits
+            if repetition_penalty > 1.0:
+                unique_recent_tokens = set(generated[0, :].tolist())# A set of unique recent tokens for efficient lookup
                 
                 for token_id in unique_recent_tokens:
-                    # Apply the repetition penalty to only the tokens that have appeared recently
                     if final_logits[0, token_id] < 0:
                         final_logits[0, token_id] = final_logits[0, token_id] * repetition_penalty
                     else:
                         final_logits[0, token_id] = final_logits[0, token_id] / repetition_penalty
 
-            
+
             probs = torch.softmax(final_logits, dim=-1)
+
+            # Applies top-p sampling to the final logits
             if top_p < 1.0:
                 sorted_probs, sorted_idx = torch.sort(probs, descending=True)
                 cum = torch.cumsum(sorted_probs, dim=-1)
@@ -338,13 +311,17 @@ class LSDPerturbedLLM:
             else:
                 next_token = torch.multinomial(probs, num_samples=1)
 
-            print(self.tokenizer.decode(next_token[0]))
+            if self.debug:
+                print(f'Next token: {self.tokenizer.decode(next_token[0])}')
 
-            generated = torch.cat([generated, next_token], dim=-1)
+            generated = torch.cat([generated, next_token], dim=-1)#Generated tokens are updated
 
+            # Breaks if the end of the sequence token is generated
             if next_token.item() == self.tokenizer.eos_token_id:
                 break
 
+        # Decodes the generated tokens
+        # Only returns the new tokens if the flag is set
         if only_new_tokens:
             new_tokens = generated[:, input_ids.shape[-1]:]
             llm_response = self.tokenizer.decode(new_tokens[0], skip_special_tokens=True)
@@ -352,7 +329,4 @@ class LSDPerturbedLLM:
             llm_response = self.tokenizer.decode(generated[0], skip_special_tokens=True)
 
         return llm_response
-
-    #dtype = torch.bfloat16
-    #force_eager_attention: bool = True force either way
 
